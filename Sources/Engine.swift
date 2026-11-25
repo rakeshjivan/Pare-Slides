@@ -63,6 +63,9 @@ final class Session: ObservableObject {
     @Published var note: String?
     @Published var busy = false
     @Published var showResults = false
+    @Published var includeVideo = false
+    @Published var exporting: String?
+    @Published var exportMessage: String?
 
     let work: URL = {
         let u = FileManager.default.temporaryDirectory.appendingPathComponent("PareSlides-\(UUID().uuidString)")
@@ -285,6 +288,45 @@ final class Session: ObservableObject {
         var s = Set(max(0, lo)...min(max(0, slides.count - 1), max(lo, hi)))
         for c in job.cues { s.insert(c.slide) }
         return s
+    }
+
+    /// Export every matched recording as its own Camtasia project, all into one folder.
+    func exportAll() {
+        guard anyDone, exporting == nil else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Export Here"
+        panel.message = "Choose a folder. Each matched recording becomes its own Camtasia project."
+        guard panel.runModal() == .OK, let folder = panel.url else { return }
+        let plans = jobs.compactMap { plan(for: $0, includeRecording: includeVideo) }
+        let skipped = jobs.count - plans.count
+        exportMessage = nil
+        Task {
+            var made: [URL] = []
+            var failed: [String] = []
+            for (i, plan) in plans.enumerated() {
+                exporting = plans.count > 1 ? "Making Camtasia project \(i + 1) of \(plans.count)…" : "Making the Camtasia project…"
+                var url = folder.appendingPathComponent(plan.title + ".cmproj")
+                var n = 2
+                while FileManager.default.fileExists(atPath: url.path) {
+                    url = folder.appendingPathComponent("\(plan.title) \(n).cmproj"); n += 1
+                }
+                let target = url
+                do {
+                    try await Task.detached { try Export.camtasia(plan, to: target) }.value
+                    made.append(target)
+                } catch { failed.append(plan.title) }
+            }
+            exporting = nil
+            var msg: [String] = []
+            if !made.isEmpty { msg.append("Exported \(made.count) Camtasia project\(made.count == 1 ? "" : "s").") }
+            if !failed.isEmpty { msg.append("Couldn't export: " + failed.joined(separator: ", ") + ".") }
+            if skipped > 0 { msg.append("\(skipped) recording\(skipped == 1 ? " isn't" : "s aren't") matched yet, so \(skipped == 1 ? "it was" : "they were") left out.") }
+            exportMessage = msg.joined(separator: " ")
+            if !made.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(made) }
+        }
     }
 
     func plan(for job: Job, includeRecording: Bool) -> Export.Plan? {

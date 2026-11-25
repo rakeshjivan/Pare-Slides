@@ -179,11 +179,21 @@ struct SetupView: View {
                             if s.current?.isDone != true { s.selected = s.jobs.first { $0.isDone }?.id }
                             s.showResults = true
                         } label: {
-                            Label("Check & Export", systemImage: "checklist").padding(.horizontal, 8).padding(.vertical, 4)
+                            Label("Check", systemImage: "checklist").padding(.horizontal, 8).padding(.vertical, 4)
                         }
                         .controlSize(.large)
+                        Button { s.exportAll() } label: {
+                            Label(s.jobs.filter(\.isDone).count > 1 ? "Export All \(s.jobs.filter(\.isDone).count) to Camtasia…" : "Export to Camtasia…",
+                                  systemImage: "square.and.arrow.up.on.square")
+                                .font(.title3.weight(.semibold)).padding(.horizontal, 10).padding(.vertical, 6)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+                        .disabled(s.exporting != nil)
                     }
                 }
+                if let e = s.exporting { HStack { ProgressView().controlSize(.small); Text(e) } }
+                if let m = s.exportMessage { Text(m).foregroundStyle(.secondary) }
                 StatusLine()
             }
             .padding(28)
@@ -318,7 +328,6 @@ struct DropCard: View {
 struct EditorView: View {
     @ObservedObject private var s = Session.shared
     @ObservedObject private var player = Player.shared
-    @State private var includeVideo = false
     @State private var exporting: String?
     @State private var exportError: String?
 
@@ -374,8 +383,13 @@ struct EditorView: View {
             if let st = s.status, s.busy { HStack(spacing: 6) { ProgressView().controlSize(.small); Text(st).foregroundStyle(.secondary) } }
             Spacer()
             if s.jobs.count > 1 {
-                Button { exportAll() } label: { Label("Export All Camtasia Projects…", systemImage: "square.and.arrow.up.on.square") }
-                    .disabled(!s.anyDone || exporting != nil)
+                Button { s.exportAll() } label: {
+                    Label("Export All (\(s.jobs.filter(\.isDone).count)) to Camtasia…", systemImage: "square.and.arrow.up.on.square")
+                        .padding(.horizontal, 4)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!s.anyDone || s.exporting != nil)
+                .help("Save every matched recording as its own Camtasia project, all into one folder")
             }
         }
         .padding(.horizontal, 16).padding(.vertical, 8)
@@ -440,18 +454,20 @@ struct EditorView: View {
     private var exportBar: some View {
         VStack(spacing: 8) {
             HStack {
-                Toggle("Also put the original video in the Media Bin", isOn: $includeVideo)
+                Toggle("Also put the original video in the Media Bin", isOn: $s.includeVideo)
                     .disabled(!["mp4", "mov", "m4v"].contains(s.recording?.pathExtension.lowercased() ?? ""))
                 Spacer()
                 Button { export(mp4: true) } label: { Label("Export MP4…", systemImage: "film") }
                     .disabled(exporting != nil)
                 Button { export(mp4: false) } label: {
-                    Label("Export Camtasia Project…", systemImage: "square.and.arrow.up").padding(.horizontal, 4)
+                    Label(s.jobs.count > 1 ? "Export This One to Camtasia…" : "Export Camtasia Project…", systemImage: "square.and.arrow.up").padding(.horizontal, 4)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(exporting != nil)
+                .tint(s.jobs.count > 1 ? .secondary : .accentColor)
+                .disabled(exporting != nil || s.exporting != nil)
             }
-            if let e = exporting { HStack { ProgressView().controlSize(.small); Text(e) } }
+            if let e = exporting ?? s.exporting { HStack { ProgressView().controlSize(.small); Text(e) } }
+            if let m = s.exportMessage { Text(m).foregroundStyle(.secondary) }
             if let e = exportError { Text(e).foregroundStyle(.orange) }
             if let n = s.current?.note { Text(n).font(.caption).foregroundStyle(.secondary) }
         }
@@ -474,7 +490,7 @@ struct EditorView: View {
     }
 
     private func export(mp4: Bool) {
-        guard let job = s.current, let plan = s.plan(for: job, includeRecording: includeVideo) else { return }
+        guard let job = s.current, let plan = s.plan(for: job, includeRecording: s.includeVideo) else { return }
         let base = job.name
         let panel = NSSavePanel()
         panel.canCreateDirectories = true
@@ -498,44 +514,6 @@ struct EditorView: View {
                 exportError = "Export failed: \(error.localizedDescription)"
             }
             exporting = nil
-        }
-    }
-}
-
-extension EditorView {
-    func exportAll() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.canCreateDirectories = true
-        panel.prompt = "Export Here"
-        panel.message = "Choose a folder. Each matched recording becomes its own Camtasia project."
-        guard panel.runModal() == .OK, let folder = panel.url else { return }
-        let plans = s.jobs.compactMap { s.plan(for: $0, includeRecording: includeVideo) }
-        let skipped = s.jobs.count - plans.count
-        exportError = nil
-        Task {
-            var made: [URL] = []
-            var failed: [String] = []
-            for (i, plan) in plans.enumerated() {
-                exporting = "Making Camtasia project \(i + 1) of \(plans.count)…"
-                var url = folder.appendingPathComponent(plan.title + ".cmproj")
-                var n = 2
-                while FileManager.default.fileExists(atPath: url.path) {
-                    url = folder.appendingPathComponent("\(plan.title) \(n).cmproj"); n += 1
-                }
-                let target = url
-                do {
-                    try await Task.detached { try Export.camtasia(plan, to: target) }.value
-                    made.append(target)
-                } catch { failed.append(plan.title) }
-            }
-            exporting = nil
-            var msg: [String] = []
-            if !failed.isEmpty { msg.append("Couldn't export: " + failed.joined(separator: ", ")) }
-            if skipped > 0 { msg.append("\(skipped) recording\(skipped == 1 ? " isn't" : "s aren't") matched yet, so \(skipped == 1 ? "it was" : "they were") left out.") }
-            exportError = msg.isEmpty ? nil : msg.joined(separator: " ")
-            if !made.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(made) }
         }
     }
 }
