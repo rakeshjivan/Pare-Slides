@@ -18,6 +18,8 @@ enum Export {
         var title: String
         /// Only these slide indexes go in the Media Bin (nil = every slide).
         var binOnly: Set<Int>? = nil
+        /// Keyword finds, added as timeline markers.
+        var finds: [Find] = []
     }
 
     // MARK: Camtasia
@@ -123,6 +125,15 @@ enum Export {
             ["ident": "", "audioMuted": false, "videoHidden": false, "magnetic": false, "matte": 0, "solo": false,
              "metadata": ["IsLocked": "False", "trackHeight": "54"]]
         }
+        // Keyword finds as timeline markers (labelled flags above the timeline).
+        var timelineParameters: [String: Any] = [:]
+        let markerTimes = p.finds.map { f -> [String: Any] in
+            let t = ticks(f.start)
+            return ["time": t, "endTime": t, "value": f.search, "duration": 0]
+        }
+        if !markerTimes.isEmpty {
+            timelineParameters["toc"] = ["type": "string", "keyframes": markerTimes]
+        }
         let project: [String: Any] = [
             "title": p.title, "description": "", "author": "",
             "targetLoudness": -18.0, "shouldApplyLoudnessNormalization": true,
@@ -142,7 +153,7 @@ enum Export {
                     "foregroundColor": [255, 255, 255, 255], "lang": "en", "alignment": 0, "defaultFontSize": true,
                     "opacity": 0.5, "backgroundEnabled": true, "backgroundOnlyAroundText": true,
                 ],
-                "backgroundColor": [0, 0, 0, 255], "parameters": [String: Any](), "gain": 1.0,
+                "backgroundColor": [0, 0, 0, 255], "parameters": timelineParameters, "gain": 1.0,
                 "legacyAttenuateAudioMix": false,
             ],
             "metadata": ["hasNotifiedAboutHFRMedia": false],

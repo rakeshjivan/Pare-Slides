@@ -8,6 +8,12 @@ Put your slides on screen at the right moments in a recorded talk, then finish i
 4. Check the change points. Play from any change, nudge it by half a second, type an exact time, swap the slide, add or remove a change, or click a line of the transcript to change slide there.
 5. **Export Camtasia Project…** gives you a `.cmproj` with the slides on track 1, the sound on track 2, and every slide in the Media Bin. **Export MP4…** gives you a finished video. With several recordings, **Export All Camtasia Projects…** makes one project per recording in a folder you choose.
 
+## Keyword finds
+
+Add keywords or phrases to find, such as `protein` or `nervous system`. Join words with `+` to find them said together (within about 10 seconds), in any order: `six + weeks`. Number words and digits count as the same ("six" finds "6"), and "week" finds "weeks".
+
+Every find becomes a marker on the Camtasia timeline, labelled with the search. A list of every find, with its time and what was said, is saved next to the export as `Keyword finds.csv` (opens in Excel or Numbers). The keyword list is kept for next time.
+
 ## Matching
 
 - With **Claude connected** (the button at the top right: sign in with Google, once per Mac), Claude reads the full transcript and the full deck and picks the change points. It uses your Claude subscription through Claude Code.

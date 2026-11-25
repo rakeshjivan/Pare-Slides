@@ -23,6 +23,13 @@ struct Line: Identifiable, Codable, Equatable {
     var start: Double
     var end: Double
     var text: String
+    /// Each word with the time it's said (empty if the speech engine didn't give word times).
+    var words: [TimedWord] = []
+}
+
+struct TimedWord: Codable, Equatable {
+    var text: String
+    var start: Double
 }
 
 /// "Show slide N from this time."
@@ -66,6 +73,18 @@ final class Session: ObservableObject {
     @Published var includeVideo = false
     @Published var exporting: String?
     @Published var exportMessage: String?
+    /// Keyword searches, e.g. "six + weeks". Kept between launches.
+    @Published var searches: [String] = UserDefaults.standard.stringArray(forKey: "searches") ?? [] {
+        didSet { UserDefaults.standard.set(searches, forKey: "searches") }
+    }
+
+    func addSearch(_ text: String) {
+        let t = text.trimmed
+        guard !t.isEmpty, !searches.contains(where: { $0.lowercased() == t.lowercased() }) else { return }
+        searches.append(t)
+    }
+
+    func finds(for job: Job) -> [Find] { Keywords.find(searches, in: job.lines) }
 
     let work: URL = {
         let u = FileManager.default.temporaryDirectory.appendingPathComponent("PareSlides-\(UUID().uuidString)")
@@ -319,9 +338,25 @@ final class Session: ObservableObject {
                     made.append(target)
                 } catch { failed.append(plan.title) }
             }
+            if !searches.isEmpty, !made.isEmpty {
+                var csv = folder.appendingPathComponent("Keyword finds.csv")
+                var n = 2
+                while FileManager.default.fileExists(atPath: csv.path) {
+                    csv = folder.appendingPathComponent("Keyword finds \(n).csv"); n += 1
+                }
+                let rows = plans.flatMap { p in p.finds.map { (p.title, $0) } }
+                if (try? Keywords.csv(rows, searches: searches).write(to: csv, atomically: true, encoding: .utf8)) != nil {
+                    made.append(csv)
+                }
+            }
             exporting = nil
             var msg: [String] = []
-            if !made.isEmpty { msg.append("Exported \(made.count) Camtasia project\(made.count == 1 ? "" : "s").") }
+            let projects = made.filter { $0.pathExtension == "cmproj" }.count
+            if projects > 0 { msg.append("Exported \(projects) Camtasia project\(projects == 1 ? "" : "s").") }
+            if !searches.isEmpty, projects > 0 {
+                let total = plans.reduce(0) { $0 + $1.finds.count }
+                msg.append("\(total) keyword find\(total == 1 ? "" : "s") marked, and listed in Keyword finds.csv.")
+            }
             if !failed.isEmpty { msg.append("Couldn't export: " + failed.joined(separator: ", ") + ".") }
             if skipped > 0 { msg.append("\(skipped) recording\(skipped == 1 ? " isn't" : "s aren't") matched yet, so \(skipped == 1 ? "it was" : "they were") left out.") }
             exportMessage = msg.joined(separator: " ")
@@ -332,7 +367,8 @@ final class Session: ObservableObject {
     func plan(for job: Job, includeRecording: Bool) -> Export.Plan? {
         guard let wav = job.wav, job.isDone else { return nil }
         return Export.Plan(slides: slides, cues: job.cues, duration: job.duration, wav: wav, recording: job.recording,
-                           includeRecording: includeRecording, title: job.name, binOnly: binSlides(for: job))
+                           includeRecording: includeRecording, title: job.name, binOnly: binSlides(for: job),
+                           finds: finds(for: job))
     }
 }
 
@@ -535,22 +571,24 @@ enum Transcriber {
     static func group(_ words: [(String, Double, Double)]) -> [Line] {
         var out: [Line] = []
         var cur: [String] = []
+        var tw: [TimedWord] = []
         var s = 0.0, e = 0.0
         for (w, ws, we) in words.sorted(by: { $0.1 < $1.1 }) {
             let pause = !cur.isEmpty && ws - e > 0.8
             if pause || cur.count >= 12 {
-                out.append(Line(start: s, end: e, text: cur.joined(separator: " ")))
-                cur = []
+                out.append(Line(start: s, end: e, text: cur.joined(separator: " "), words: tw))
+                cur = []; tw = []
             }
             if cur.isEmpty { s = ws }
             cur.append(w.trimmed)
+            tw.append(TimedWord(text: w.trimmed, start: ws))
             e = we
             if let last = w.trimmed.last, ".?!".contains(last), cur.count >= 4 {
-                out.append(Line(start: s, end: e, text: cur.joined(separator: " ")))
-                cur = []
+                out.append(Line(start: s, end: e, text: cur.joined(separator: " "), words: tw))
+                cur = []; tw = []
             }
         }
-        if !cur.isEmpty { out.append(Line(start: s, end: e, text: cur.joined(separator: " "))) }
+        if !cur.isEmpty { out.append(Line(start: s, end: e, text: cur.joined(separator: " "), words: tw)) }
         return out
     }
 }
@@ -672,6 +710,130 @@ enum Matcher {
             if let last = out.last, cue.start - last.start < 0.5 { out[out.count - 1] = Cue(slide: cue.slide, start: last.start); continue }
             if duration > 0, cue.start >= duration { continue }
             out.append(cue)
+        }
+        return out
+    }
+}
+
+
+// MARK: - Keyword finds
+
+/// One place a keyword search turns up in a recording.
+struct Find: Identifiable, Equatable {
+    let id = UUID()
+    var search: String
+    var start: Double
+    var end: Double
+    var context: String
+}
+
+enum Keywords {
+    /// Words are counted as "together" when they're said within this many seconds of each other.
+    static let window = 10.0
+
+    private static let numbers: [String: String] = [
+        "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6", "seven": "7",
+        "eight": "8", "nine": "9", "ten": "10", "eleven": "11", "twelve": "12", "thirteen": "13", "fourteen": "14",
+        "fifteen": "15", "sixteen": "16", "seventeen": "17", "eighteen": "18", "nineteen": "19", "twenty": "20",
+        "thirty": "30", "forty": "40", "fifty": "50", "sixty": "60", "seventy": "70", "eighty": "80", "ninety": "90",
+        "hundred": "100", "first": "1st", "second": "2nd", "third": "3rd",
+    ]
+
+    /// Lowercase pieces, punctuation removed, number words as digits ("Six-week" → ["6", "week"]).
+    static func tokens(_ s: String) -> [String] {
+        s.lowercased()
+            .replacingOccurrences(of: "\u{2019}", with: "'")
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "'" })
+            .map { piece -> String in
+                var w = String(piece)
+                if w.hasSuffix("'s") { w.removeLast(2) }
+                w = w.replacingOccurrences(of: "'", with: "")
+                return numbers[w] ?? w
+            }
+            .filter { !$0.isEmpty }
+    }
+
+    /// "week" finds "weeks" and the other way round.
+    static func same(_ a: String, _ b: String) -> Bool {
+        a == b || a + "s" == b || b + "s" == a || a + "es" == b || b + "es" == a
+    }
+
+    /// The parts of a search: "six + weeks" → [["6"], ["weeks"]]; "nervous system" → [["nervous", "system"]].
+    static func parts(_ search: String) -> [[String]] {
+        search.split(separator: "+").map { tokens(String($0)) }.filter { !$0.isEmpty }
+    }
+
+    static func find(_ searches: [String], in lines: [Line]) -> [Find] {
+        // Every word in the recording, with a time.
+        var stream: [(word: String, time: Double, line: Int)] = []
+        for (li, line) in lines.enumerated() {
+            if !line.words.isEmpty {
+                for w in line.words { for t in tokens(w.text) { stream.append((t, w.start, li)) } }
+            } else {
+                let ts = tokens(line.text)
+                for (i, t) in ts.enumerated() {
+                    let f = ts.count > 1 ? Double(i) / Double(ts.count - 1) : 0
+                    stream.append((t, line.start + f * (line.end - line.start), li))
+                }
+            }
+        }
+        guard !stream.isEmpty else { return [] }
+
+        func occurrences(_ phrase: [String]) -> [(time: Double, line: Int)] {
+            guard !phrase.isEmpty, stream.count >= phrase.count else { return [] }
+            var out: [(Double, Int)] = []
+            for i in 0...(stream.count - phrase.count) {
+                var ok = true
+                for (k, p) in phrase.enumerated() where !same(stream[i + k].word, p) { ok = false; break }
+                if ok { out.append((stream[i].time, stream[i].line)) }
+            }
+            return out
+        }
+
+        var finds: [Find] = []
+        for search in searches {
+            let ps = parts(search)
+            guard !ps.isEmpty else { continue }
+            let occ = ps.map(occurrences)
+            guard occ.allSatisfy({ !$0.isEmpty }) else { continue }
+            let anchor = occ.indices.min { occ[$0].count < occ[$1].count } ?? 0
+            var hits: [(start: Double, end: Double, first: Int, last: Int)] = []
+            for a in occ[anchor] {
+                var lo = a.time, hi = a.time, l0 = a.line, l1 = a.line
+                var ok = true
+                for (pi, list) in occ.enumerated() where pi != anchor {
+                    guard let near = list.min(by: { abs($0.time - a.time) < abs($1.time - a.time) }),
+                          abs(near.time - a.time) <= window else { ok = false; break }
+                    lo = min(lo, near.time); hi = max(hi, near.time)
+                    l0 = min(l0, near.line); l1 = max(l1, near.line)
+                }
+                guard ok else { continue }
+                if let last = hits.last, lo - last.start <= window { continue }   // same moment, already found
+                hits.append((lo, hi, l0, l1))
+            }
+            for h in hits {
+                let context = lines[h.first...h.last].map(\.text).joined(separator: " ")
+                finds.append(Find(search: search, start: h.start, end: h.end, context: context))
+            }
+        }
+        return finds.sorted { $0.start < $1.start }
+    }
+
+    static func hms(_ t: Double) -> String {
+        let s = Int(t.rounded(.down))
+        return String(format: "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60)
+    }
+
+    /// A spreadsheet (CSV, opens in Excel or Numbers) of every find.
+    static func csv(_ rows: [(recording: String, find: Find)], searches: [String]) -> String {
+        func q(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\"", with: "\"\"") + "\"" }
+        var out = "\u{FEFF}Recording,Time,Seconds,Search,What was said\n"
+        for r in rows {
+            out += [q(r.recording), hms(r.find.start), String(format: "%.1f", r.find.start), q(r.find.search), q(r.find.context)]
+                .joined(separator: ",") + "\n"
+        }
+        if rows.isEmpty {
+            out += q("No finds") + ",,," + q(searches.joined(separator: "; ")) + ",\n"
         }
         return out
     }

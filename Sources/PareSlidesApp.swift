@@ -145,6 +145,7 @@ struct SetupView: View {
                     }
                     .frame(height: 76)
                 }
+                KeywordBox()
                 if !s.jobs.isEmpty {
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
@@ -215,6 +216,87 @@ struct SetupView: View {
                 .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(.separator))
         } else {
             RoundedRectangle(cornerRadius: 4).fill(.quaternary)
+        }
+    }
+}
+
+struct KeywordBox: View {
+    @ObservedObject private var s = Session.shared
+    @State private var text = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Keywords to find (optional)", systemImage: "flag").font(.headline)
+                Spacer()
+                Text("Use + for words said together, e.g. six + weeks").font(.caption).foregroundStyle(.secondary)
+            }
+            HStack {
+                TextField("Add a keyword or phrase, e.g. six + weeks", text: $text)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(add)
+                Button("Add", action: add).disabled(text.trimmed.isEmpty)
+            }
+            if !s.searches.isEmpty {
+                FlowChips(items: s.searches) { item in s.searches.removeAll { $0 == item } }
+                Text("Each find becomes a marker in the Camtasia project, and a list of times (Keyword finds.csv) is saved with the export. Words joined with + count as together when they're said within about 10 seconds of each other.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.06)))
+    }
+
+    private func add() {
+        s.addSearch(text)
+        text = ""
+    }
+}
+
+/// Removable chips that wrap onto new lines.
+struct FlowChips: View {
+    let items: [String]
+    let remove: (String) -> Void
+
+    var body: some View {
+        WrapLayout(spacing: 6) {
+            ForEach(items, id: \.self) { item in
+                HStack(spacing: 4) {
+                    Text(item)
+                    Button { remove(item) } label: { Image(systemName: "xmark.circle.fill") }
+                        .buttonStyle(.borderless).foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 10).padding(.vertical, 4)
+                .background(Capsule().fill(Color.orange.opacity(0.15)))
+            }
+        }
+    }
+}
+
+struct WrapLayout: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? 600
+        var x: CGFloat = 0, y: CGFloat = 0, row: CGFloat = 0, widest: CGFloat = 0
+        for v in subviews {
+            let sz = v.sizeThatFits(.unspecified)
+            if x > 0, x + sz.width > width { x = 0; y += row + spacing; row = 0 }
+            x += sz.width + spacing
+            widest = max(widest, x - spacing)
+            row = max(row, sz.height)
+        }
+        return CGSize(width: min(width, widest), height: y + row)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX, y = bounds.minY, row: CGFloat = 0
+        for v in subviews {
+            let sz = v.sizeThatFits(.unspecified)
+            if x > bounds.minX, x + sz.width > bounds.maxX { x = bounds.minX; y += row + spacing; row = 0 }
+            v.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(sz))
+            x += sz.width + spacing
+            row = max(row, sz.height)
         }
     }
 }
@@ -332,6 +414,7 @@ struct EditorView: View {
     @State private var exportError: String?
 
     private var current: Int? { s.cueIndex(at: player.time) }
+    private var findStarts: [Find] { s.current.map { s.finds(for: $0) } ?? [] }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -448,6 +531,19 @@ struct EditorView: View {
                 .keyboardShortcut(.space, modifiers: [])
             Slider(value: Binding(get: { player.time }, set: { player.seek($0) }), in: 0...max(1, s.duration))
             Text("\(clock(player.time)) / \(clock(s.duration))").monospacedDigit().foregroundStyle(.secondary)
+            if !s.searches.isEmpty, let job = s.current {
+                let finds = s.finds(for: job)
+                Menu {
+                    if finds.isEmpty { Text("No keyword finds in this recording") }
+                    ForEach(finds) { f in
+                        Button("\(clock(f.start))   \(f.search)   “\(f.context.prefix(60))…”") { player.play(from: max(0, f.start - 1)) }
+                    }
+                } label: {
+                    Label("\(finds.count) find\(finds.count == 1 ? "" : "s")", systemImage: "flag.fill")
+                }
+                .fixedSize()
+                .help("Keyword finds in this recording. Each one becomes a marker in the Camtasia project.")
+            }
         }
     }
 
@@ -478,7 +574,8 @@ struct EditorView: View {
             Text("What's said").font(.headline).padding(12)
             ScrollViewReader { proxy in
                 List(s.lines) { line in
-                    LineRow(line: line, isNow: player.time >= line.start && player.time < line.end)
+                    LineRow(line: line, isNow: player.time >= line.start && player.time < line.end,
+                            find: findStarts.first { $0.start >= line.start - 0.05 && $0.start <= line.end + 0.05 }?.search)
                         .id(line.id)
                 }
                 .listStyle(.inset)
@@ -509,7 +606,15 @@ struct EditorView: View {
                     try await Task.detached { try Export.camtasia(plan, to: url) }.value
                 }
                 let shown = mp4 || url.pathExtension.lowercased() == "cmproj" ? url : url.appendingPathExtension("cmproj")
-                NSWorkspace.shared.activateFileViewerSelecting([shown])
+                var files = [shown]
+                if !mp4, !s.searches.isEmpty {
+                    let csv = shown.deletingLastPathComponent().appendingPathComponent(base + " keyword finds.csv")
+                    let rows = plan.finds.map { (base, $0) }
+                    if (try? Keywords.csv(rows, searches: s.searches).write(to: csv, atomically: true, encoding: .utf8)) != nil {
+                        files.append(csv)
+                    }
+                }
+                NSWorkspace.shared.activateFileViewerSelecting(files)
             } catch {
                 exportError = "Export failed: \(error.localizedDescription)"
             }
@@ -575,12 +680,18 @@ struct CueRow: View {
 struct LineRow: View {
     let line: Line
     let isNow: Bool
+    var find: String? = nil
     @ObservedObject private var s = Session.shared
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
             Text(clock(line.start)).font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(width: 48, alignment: .leading)
-            Text(line.text).font(.callout).fontWeight(isNow ? .semibold : .regular)
+            VStack(alignment: .leading, spacing: 2) {
+                if let find {
+                    Label(find, systemImage: "flag.fill").font(.caption2.weight(.semibold)).foregroundStyle(.orange)
+                }
+                Text(line.text).font(.callout).fontWeight(isNow ? .semibold : .regular)
+            }
             Spacer(minLength: 0)
             Menu {
                 ForEach(s.slides.indices, id: \.self) { i in
