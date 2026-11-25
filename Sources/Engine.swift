@@ -78,6 +78,24 @@ final class Session: ObservableObject {
         didSet { UserDefaults.standard.set(searches, forKey: "searches") }
     }
 
+    var isEmpty: Bool { jobs.isEmpty && slides.isEmpty }
+
+    /// Clear the recordings and the deck to start a new batch. Keywords are kept.
+    func reset() {
+        guard !busy, exporting == nil else { return }
+        jobs = []
+        selected = nil
+        slides = []
+        slidesSource = nil
+        showResults = false
+        status = nil
+        problem = nil
+        note = nil
+        exportMessage = nil
+        try? FileManager.default.removeItem(at: work)
+        try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+    }
+
     func addSearch(_ text: String) {
         let t = text.trimmed
         guard !t.isEmpty, !searches.contains(where: { $0.lowercased() == t.lowercased() }) else { return }

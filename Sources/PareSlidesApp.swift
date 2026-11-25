@@ -80,6 +80,7 @@ struct MainView: View {
     @ObservedObject private var s = Session.shared
     @ObservedObject private var connect = ClaudeConnect.shared
     @State private var showConnect = false
+    @State private var confirmNew = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -87,6 +88,17 @@ struct MainView: View {
                 Image(systemName: "rectangle.on.rectangle.angled").font(.title2).foregroundStyle(Color.accentColor)
                 Text("Pare Slides").font(.title2.weight(.semibold))
                 Spacer()
+                Button { confirmNew = true } label: { Label("Start New", systemImage: "arrow.counterclockwise") }
+                    .disabled(s.isEmpty || s.busy || s.exporting != nil)
+                    .help("Clear the recordings and slides to start a new batch")
+                    .confirmationDialog("Start a new batch?", isPresented: $confirmNew) {
+                        Button("Clear Recordings and Slides", role: .destructive) {
+                            Player.shared.load(nil)
+                            s.reset()
+                        }
+                    } message: {
+                        Text("This clears the recordings, the slide deck and the slide timings. Export anything you need first. Your keywords are kept.")
+                    }
                 UpdateButton(busy: s.busy)
                 Button { showConnect.toggle() } label: {
                     if case .connected = connect.phase {
