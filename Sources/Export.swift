@@ -16,6 +16,8 @@ enum Export {
         var recording: URL?
         var includeRecording: Bool
         var title: String
+        /// Only these slide indexes go in the Media Bin (nil = every slide).
+        var binOnly: Set<Int>? = nil
     }
 
     // MARK: Camtasia
@@ -74,10 +76,10 @@ enum Export {
         }
         func ticks(_ s: Double) -> Int64 { Int64((s * Double(ticksPerSecond)).rounded()) }
 
-        // Every slide in the Media Bin.
+        // The slides in the Media Bin (every slide, or this recording's range).
         var bin: [[String: Any]] = []
         var slideSource: [Int: Int] = [:]
-        for (i, s) in p.slides.enumerated() {
+        for (i, s) in p.slides.enumerated() where p.binOnly?.contains(i) ?? true {
             let name = String(format: "Slide %02d.", s.number) + (s.url.pathExtension.isEmpty ? "png" : s.url.pathExtension.lowercased())
             let w = Int(s.size.width), h = Int(s.size.height)
             let id = newID()

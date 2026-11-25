@@ -112,51 +112,90 @@ struct SetupView: View {
     @ObservedObject private var s = Session.shared
 
     var body: some View {
-        VStack(spacing: 22) {
-            Text("Put the slides on screen at the right moments in a recorded talk.")
-                .font(.title3).foregroundStyle(.secondary)
-            HStack(spacing: 20) {
-                DropCard(title: "1. Recording", icon: "waveform",
-                         hint: "Drop the video or audio here (MP4, MOV, M4A, MP3, WAV)",
-                         detail: s.recording.map { "\($0.lastPathComponent)\(s.duration > 0 ? " · " + clock(s.duration) : "")" },
-                         types: [.movie, .audio, .mpeg4Movie, .quickTimeMovie, .mp3, .wav, .mpeg4Audio]) { urls in
-                    if let u = urls.first { s.setRecording(u) }
+        ScrollView {
+            VStack(spacing: 20) {
+                Text("Put the slides on screen at the right moments in recorded talks.")
+                    .font(.title3).foregroundStyle(.secondary)
+                HStack(spacing: 20) {
+                    DropCard(title: "1. Recordings", icon: "waveform",
+                             hint: "Drop one or more videos or audio files here (MP4, MOV, M4A, MP3, WAV)",
+                             detail: s.jobs.isEmpty ? nil : (s.jobs.count == 1 ? "1 recording" : "\(s.jobs.count) recordings") + " · drop more to add",
+                             types: [.movie, .audio, .mpeg4Movie, .quickTimeMovie, .mp3, .wav, .mpeg4Audio],
+                             multiple: true) { urls in
+                        s.addRecordings(urls)
+                    }
+                    DropCard(title: "2. Slide deck", icon: "rectangle.stack",
+                             hint: "Drop the deck: a zip or folder of slide images, or a PDF. One deck can serve all the recordings.",
+                             detail: s.slides.isEmpty ? nil : "\(s.slides.count) slides",
+                             types: [.zip, .folder, .pdf, .image], multiple: true) { urls in
+                        s.setSlides(urls)
+                    }
                 }
-                DropCard(title: "2. Slides", icon: "rectangle.stack",
-                         hint: "Drop a zip or folder of slide images, or a PDF of the deck",
-                         detail: s.slides.isEmpty ? nil : "\(s.slides.count) slides",
-                         types: [.zip, .folder, .pdf, .image]) { urls in
-                    s.setSlides(urls)
-                }
-            }
-            if !s.slides.isEmpty {
-                ScrollView(.horizontal) {
-                    HStack(spacing: 8) {
-                        ForEach(s.slides) { sl in
-                            VStack(spacing: 3) {
-                                thumb(sl).frame(width: 112, height: 63)
-                                Text("\(sl.number)").font(.caption2).foregroundStyle(.secondary)
+                if !s.slides.isEmpty {
+                    ScrollView(.horizontal) {
+                        HStack(spacing: 8) {
+                            ForEach(s.slides) { sl in
+                                VStack(spacing: 3) {
+                                    thumb(sl).frame(width: 96, height: 54)
+                                    Text("\(sl.number)").font(.caption2).foregroundStyle(.secondary)
+                                }
                             }
                         }
+                        .padding(.horizontal, 4)
                     }
-                    .padding(.horizontal, 4)
+                    .frame(height: 76)
                 }
-                .frame(height: 86)
+                if !s.jobs.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("Recordings").font(.headline)
+                            Spacer()
+                            Text("Slide range is optional: fill it in if a recording only uses part of the deck.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        VStack(spacing: 0) {
+                            ForEach(s.jobs) { job in
+                                RecordingRow(job: job)
+                                if job.id != s.jobs.last?.id { Divider() }
+                            }
+                        }
+                        .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.06)))
+                    }
+                }
+                HStack(spacing: 12) {
+                    if s.waitingCount > 0 || !s.anyDone {
+                        Button {
+                            s.processAll()
+                        } label: {
+                            Label(matchTitle, systemImage: "wand.and.stars")
+                                .font(.title3.weight(.semibold)).padding(.horizontal, 12).padding(.vertical, 6)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+                        .disabled(!s.ready || s.busy)
+                    }
+                    if s.anyDone {
+                        Button {
+                            if s.current?.isDone != true { s.selected = s.jobs.first { $0.isDone }?.id }
+                            s.showResults = true
+                        } label: {
+                            Label("Check & Export", systemImage: "checklist").padding(.horizontal, 8).padding(.vertical, 4)
+                        }
+                        .controlSize(.large)
+                    }
+                }
+                StatusLine()
             }
-            Button {
-                s.process()
-            } label: {
-                Label("3. Match Slides to Recording", systemImage: "wand.and.stars")
-                    .font(.title3.weight(.semibold)).padding(.horizontal, 12).padding(.vertical, 6)
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-            .disabled(!s.ready || s.busy)
-            StatusLine()
-            Spacer()
+            .padding(28)
+            .frame(maxWidth: 1000)
+            .frame(maxWidth: .infinity)
         }
-        .padding(28)
-        .frame(maxWidth: 1000)
+    }
+
+    private var matchTitle: String {
+        let n = s.anyDone ? s.waitingCount : s.jobs.count
+        if s.anyDone { return n == 1 ? "3. Match the New Recording" : "3. Match the \(n) New Recordings" }
+        return n <= 1 ? "3. Match Slides to Recording" : "3. Match All \(n) Recordings"
     }
 
     @ViewBuilder func thumb(_ sl: Slide) -> some View {
@@ -167,6 +206,58 @@ struct SetupView: View {
         } else {
             RoundedRectangle(cornerRadius: 4).fill(.quaternary)
         }
+    }
+}
+
+struct JobStateView: View {
+    let state: Job.State
+    var body: some View {
+        switch state {
+        case .waiting: Label("Waiting", systemImage: "clock").foregroundStyle(.secondary)
+        case .working(let what): HStack(spacing: 6) { ProgressView().controlSize(.small); Text(what) }
+        case .done: Label("Matched", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+        case .failed(let why): Label(why, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange).lineLimit(2)
+        }
+    }
+}
+
+struct RecordingRow: View {
+    let job: Job
+    @ObservedObject private var s = Session.shared
+    @State private var from = ""
+    @State private var to = ""
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: ["m4a", "mp3", "wav", "aif", "aiff", "aac", "caf"].contains(job.recording.pathExtension.lowercased())
+                  ? "waveform" : "film")
+                .foregroundStyle(.secondary).frame(width: 20)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(job.recording.lastPathComponent).lineLimit(1).truncationMode(.middle)
+                Text(job.duration > 0 ? clock(job.duration) : " ").font(.caption).foregroundStyle(.secondary)
+            }
+            .frame(minWidth: 200, alignment: .leading)
+            Spacer()
+            JobStateView(state: job.state).font(.callout).frame(maxWidth: 300, alignment: .trailing)
+            HStack(spacing: 4) {
+                Text("Slides").font(.callout).foregroundStyle(.secondary)
+                TextField("first", text: $from).frame(width: 46).multilineTextAlignment(.center).onSubmit(apply)
+                Text("to").font(.callout).foregroundStyle(.secondary)
+                TextField("last", text: $to).frame(width: 46).multilineTextAlignment(.center).onSubmit(apply)
+            }
+            .disabled(s.busy || s.slides.isEmpty)
+            .help("Optional. If this recording only uses part of the deck, enter its first and last slide numbers.")
+            Button { s.removeJob(job.id) } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
+                .buttonStyle(.borderless).disabled(s.busy).help("Remove this recording")
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .onAppear { from = job.from.map(String.init) ?? ""; to = job.to.map(String.init) ?? "" }
+        .onChange(of: from) { _, _ in apply() }
+        .onChange(of: to) { _, _ in apply() }
+    }
+
+    private func apply() {
+        s.setRange(job.id, from: Int(from.trimmed), to: Int(to.trimmed))
     }
 }
 
@@ -188,6 +279,7 @@ struct DropCard: View {
     let hint: String
     let detail: String?
     let types: [UTType]
+    var multiple = false
     let onFiles: ([URL]) -> Void
     @State private var targeted = false
 
@@ -216,7 +308,7 @@ struct DropCard: View {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = types
         panel.canChooseDirectories = types.contains(.folder)
-        panel.allowsMultipleSelection = types.contains(.image)
+        panel.allowsMultipleSelection = multiple
         if panel.runModal() == .OK { onFiles(panel.urls) }
     }
 }
@@ -233,20 +325,60 @@ struct EditorView: View {
     private var current: Int? { s.cueIndex(at: player.time) }
 
     var body: some View {
-        HStack(spacing: 0) {
-            cueList.frame(width: 330)
+        VStack(spacing: 0) {
+            topBar
             Divider()
-            VStack(spacing: 12) {
-                preview
-                transport
-                Divider()
-                exportBar
+            if let job = s.current, job.isDone {
+                HStack(spacing: 0) {
+                    cueList.frame(width: 330)
+                    Divider()
+                    VStack(spacing: 12) {
+                        preview
+                        transport
+                        Divider()
+                        exportBar
+                    }
+                    .padding(16)
+                    Divider()
+                    transcript.frame(width: 360)
+                }
+            } else {
+                VStack(spacing: 12) {
+                    Spacer()
+                    if let job = s.current { JobStateView(state: job.state).font(.title3) }
+                    Text("This recording isn't matched yet. Pick another from the menu, or wait for it to finish.")
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity)
             }
-            .padding(16)
-            Divider()
-            transcript.frame(width: 360)
         }
-        .onAppear { player.load(s.audioWAV) }
+        .task(id: s.audioWAV) { player.load(s.current?.isDone == true ? s.audioWAV : nil) }
+        .onChange(of: s.current?.isDone) { _, done in if done == true { player.load(s.audioWAV) } }
+    }
+
+    private var topBar: some View {
+        HStack(spacing: 12) {
+            Button { player.load(nil); s.showResults = false } label: { Label("Files", systemImage: "chevron.left") }
+            if s.jobs.count > 1 {
+                Picker("Recording", selection: $s.selected) {
+                    ForEach(s.jobs) { j in
+                        Text(j.name + (j.isDone ? "" : "  (not matched yet)")).tag(Optional(j.id))
+                    }
+                }
+                .frame(maxWidth: 420)
+                Text("\(s.jobs.filter(\.isDone).count) of \(s.jobs.count) matched").font(.callout).foregroundStyle(.secondary)
+            } else if let j = s.current {
+                Text(j.recording.lastPathComponent).font(.headline)
+            }
+            if let st = s.status, s.busy { HStack(spacing: 6) { ProgressView().controlSize(.small); Text(st).foregroundStyle(.secondary) } }
+            Spacer()
+            if s.jobs.count > 1 {
+                Button { exportAll() } label: { Label("Export All Camtasia Projects…", systemImage: "square.and.arrow.up.on.square") }
+                    .disabled(!s.anyDone || exporting != nil)
+            }
+        }
+        .padding(.horizontal, 16).padding(.vertical, 8)
     }
 
     // Slides with their start times
@@ -270,9 +402,9 @@ struct EditorView: View {
             }
             .listStyle(.inset)
             HStack {
-                Button("Start Over") { s.cues = []; Player.shared.load(nil) }
                 Spacer()
-                Button("Match Again") { s.cues = []; s.process() }.disabled(s.busy)
+                Button("Match Again") { if let id = s.selected { s.rematch(id) } }.disabled(s.busy)
+                    .help("Throw away these change points and match this recording again")
             }
             .padding(12)
         }
@@ -321,7 +453,7 @@ struct EditorView: View {
             }
             if let e = exporting { HStack { ProgressView().controlSize(.small); Text(e) } }
             if let e = exportError { Text(e).foregroundStyle(.orange) }
-            if let n = s.note { Text(n).font(.caption).foregroundStyle(.secondary) }
+            if let n = s.current?.note { Text(n).font(.caption).foregroundStyle(.secondary) }
         }
     }
 
@@ -342,15 +474,13 @@ struct EditorView: View {
     }
 
     private func export(mp4: Bool) {
-        guard let wav = s.audioWAV else { return }
-        let base = s.recording?.deletingPathExtension().lastPathComponent ?? "Slides"
+        guard let job = s.current, let plan = s.plan(for: job, includeRecording: includeVideo) else { return }
+        let base = job.name
         let panel = NSSavePanel()
         panel.canCreateDirectories = true
         panel.nameFieldStringValue = base + (mp4 ? " with slides.mp4" : ".cmproj")
         if mp4 { panel.allowedContentTypes = [.mpeg4Movie] }
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        let plan = Export.Plan(slides: s.slides, cues: s.cues, duration: s.duration, wav: wav,
-                               recording: s.recording, includeRecording: includeVideo, title: base)
         exportError = nil
         exporting = mp4 ? "Making the video…" : "Making the Camtasia project…"
         Task {
@@ -368,6 +498,44 @@ struct EditorView: View {
                 exportError = "Export failed: \(error.localizedDescription)"
             }
             exporting = nil
+        }
+    }
+}
+
+extension EditorView {
+    func exportAll() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Export Here"
+        panel.message = "Choose a folder. Each matched recording becomes its own Camtasia project."
+        guard panel.runModal() == .OK, let folder = panel.url else { return }
+        let plans = s.jobs.compactMap { s.plan(for: $0, includeRecording: includeVideo) }
+        let skipped = s.jobs.count - plans.count
+        exportError = nil
+        Task {
+            var made: [URL] = []
+            var failed: [String] = []
+            for (i, plan) in plans.enumerated() {
+                exporting = "Making Camtasia project \(i + 1) of \(plans.count)…"
+                var url = folder.appendingPathComponent(plan.title + ".cmproj")
+                var n = 2
+                while FileManager.default.fileExists(atPath: url.path) {
+                    url = folder.appendingPathComponent("\(plan.title) \(n).cmproj"); n += 1
+                }
+                let target = url
+                do {
+                    try await Task.detached { try Export.camtasia(plan, to: target) }.value
+                    made.append(target)
+                } catch { failed.append(plan.title) }
+            }
+            exporting = nil
+            var msg: [String] = []
+            if !failed.isEmpty { msg.append("Couldn't export: " + failed.joined(separator: ", ")) }
+            if skipped > 0 { msg.append("\(skipped) recording\(skipped == 1 ? " isn't" : "s aren't") matched yet, so \(skipped == 1 ? "it was" : "they were") left out.") }
+            exportError = msg.isEmpty ? nil : msg.joined(separator: " ")
+            if !made.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(made) }
         }
     }
 }

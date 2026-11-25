@@ -32,46 +32,97 @@ struct Cue: Identifiable, Equatable {
     var start: Double
 }
 
+/// One recording and its results.
+struct Job: Identifiable {
+    enum State: Equatable { case waiting, working(String), done, failed(String) }
+    let id = UUID()
+    var recording: URL
+    var duration: Double = 0
+    var wav: URL?
+    var lines: [Line] = []
+    var cues: [Cue] = []
+    /// Optional slide numbers (1-based) this recording covers.
+    var from: Int?
+    var to: Int?
+    var state: State = .waiting
+    var note: String?
+    var name: String { recording.deletingPathExtension().lastPathComponent }
+    var isDone: Bool { state == .done }
+}
+
 @MainActor
 final class Session: ObservableObject {
     static let shared = Session()
 
-    @Published var recording: URL?
-    @Published var duration: Double = 0
+    @Published var jobs: [Job] = []
+    @Published var selected: UUID?
     @Published var slides: [Slide] = []
     @Published var slidesSource: URL?
-    @Published var lines: [Line] = []
-    @Published var cues: [Cue] = []
     @Published var status: String?
     @Published var problem: String?
     @Published var note: String?
     @Published var busy = false
+    @Published var showResults = false
 
     let work: URL = {
         let u = FileManager.default.temporaryDirectory.appendingPathComponent("PareSlides-\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
         return u
     }()
-    /// The extracted sound: 44.1 kHz 16-bit stereo WAV (what Camtasia likes).
-    private(set) var audioWAV: URL?
-    private var audioFor: URL?
 
-    var ready: Bool { recording != nil && !slides.isEmpty }
-    var hasResult: Bool { !cues.isEmpty }
+    static let mediaTypes: Set<String> = ["mp4", "mov", "m4v", "m4a", "mp3", "wav", "aif", "aiff", "aac", "caf"]
+
+    var ready: Bool { !jobs.isEmpty && !slides.isEmpty }
+    var hasResult: Bool { showResults }
+    var anyDone: Bool { jobs.contains { $0.isDone } }
+    var waitingCount: Int { jobs.filter { !$0.isDone }.count }
+
+    // The selected recording, for the editor.
+    var sel: Int? { jobs.firstIndex { $0.id == selected } }
+    var current: Job? { sel.map { jobs[$0] } }
+    var recording: URL? { current?.recording }
+    var duration: Double { current?.duration ?? 0 }
+    var lines: [Line] { current?.lines ?? [] }
+    var audioWAV: URL? { current?.wav }
+    var cues: [Cue] {
+        get { current?.cues ?? [] }
+        set { if let i = sel { jobs[i].cues = newValue } }
+    }
 
     // MARK: Inputs
 
-    func setRecording(_ url: URL) {
-        recording = url
-        audioWAV = nil
-        audioFor = nil
-        lines = []
-        cues = []
+    func addRecordings(_ urls: [URL]) {
         problem = nil
-        Task {
-            let asset = AVURLAsset(url: url)
-            duration = (try? await asset.load(.duration).seconds) ?? 0
-            if duration.isNaN { duration = 0 }
+        var added = 0
+        for u in urls where Self.mediaTypes.contains(u.pathExtension.lowercased()) {
+            guard !jobs.contains(where: { $0.recording == u }) else { continue }
+            let job = Job(recording: u)
+            jobs.append(job)
+            added += 1
+            let id = job.id
+            Task {
+                let d = (try? await AVURLAsset(url: u).load(.duration).seconds) ?? 0
+                if let i = jobs.firstIndex(where: { $0.id == id }) { jobs[i].duration = d.isNaN ? 0 : d }
+            }
+        }
+        if added == 0, !urls.isEmpty { problem = "Those files aren't recordings Pare Slides can use (MP4, MOV, M4A, MP3, WAV)." }
+        if selected == nil { selected = jobs.first?.id }
+    }
+
+    func removeJob(_ id: UUID) {
+        guard !busy else { return }
+        jobs.removeAll { $0.id == id }
+        if selected == id { selected = jobs.first?.id }
+    }
+
+    func setRange(_ id: UUID, from: Int?, to: Int?) {
+        guard let i = jobs.firstIndex(where: { $0.id == id }) else { return }
+        let n = max(1, slides.count)
+        var f = from.map { min(max(1, $0), n) }, t = to.map { min(max(1, $0), n) }
+        if let a = f, let b = t, a > b { swap(&f, &t) }
+        if jobs[i].from != f || jobs[i].to != t {
+            jobs[i].from = f; jobs[i].to = t
+            if jobs[i].isDone { jobs[i].cues = []; jobs[i].state = .waiting }
         }
     }
 
@@ -97,7 +148,7 @@ final class Session: ObservableObject {
                 }
                 slides = list
                 slidesSource = urls.first
-                cues = []
+                for i in jobs.indices { jobs[i].cues = []; if jobs[i].isDone { jobs[i].state = .waiting } }
             } catch { problem = error.localizedDescription }
             busy = false
             status = nil
@@ -106,77 +157,141 @@ final class Session: ObservableObject {
 
     // MARK: Processing
 
-    func process() {
-        guard let rec = recording, !slides.isEmpty, !busy else { return }
+    /// Match every recording that hasn't been matched yet, one after another.
+    func processAll() {
+        guard ready, !busy else { return }
         busy = true
         problem = nil
         note = nil
-        let work = self.work
-        let slideFiles = slides.map(\.url)
         Task {
             defer { busy = false; status = nil }
-            do {
-                // 1. Sound
-                if audioWAV == nil || audioFor != rec {
-                    status = "Taking the sound out of the recording…"
-                    audioWAV = try await Audio.extract(rec, work: work)
-                    audioFor = rec
+            // Slide text, once for the whole deck.
+            if slides.contains(where: { $0.text.isEmpty }) {
+                status = "Reading the text on each slide…"
+                let files = slides.map(\.url)
+                let texts = await Task.detached { files.map(SlideReader.text) }.value
+                for i in slides.indices where i < texts.count { slides[i].text = texts[i] }
+            }
+            let ids = jobs.filter { !$0.isDone }.map(\.id)
+            for (n, id) in ids.enumerated() {
+                status = ids.count > 1 ? "Recording \(n + 1) of \(ids.count)" : nil
+                await run(id)
+                if let i = jobs.firstIndex(where: { $0.id == id }), jobs[i].isDone, !showResults {
+                    selected = id
+                    showResults = true
                 }
-                guard let wav = audioWAV else { return }
-                if duration <= 0, let f = try? AVAudioFile(forReading: wav) {
-                    duration = Double(f.length) / f.processingFormat.sampleRate
-                }
-                // 2. Words, with times
-                if lines.isEmpty {
-                    status = "Listening to the recording (on this Mac)… this takes a little while for long videos."
-                    lines = try await Transcriber.transcribe(wav)
-                    guard !lines.isEmpty else { throw PGError("No speech was found in the recording.") }
-                }
-                // 3. Slide text
-                if slides.contains(where: { $0.text.isEmpty }) {
-                    status = "Reading the text on each slide…"
-                    let texts = await Task.detached { slideFiles.map(SlideReader.text) }.value
-                    for i in slides.indices where i < texts.count { slides[i].text = texts[i] }
-                }
-                // 4. Match
-                status = ClaudeCLI.find() != nil ? "Claude is matching the slides to what's said…" : "Matching the slides to what's said…"
-                let ls = lines, sl = slides, dur = duration
-                var result: [Cue] = []
-                if ClaudeCLI.find() != nil {
-                    do { result = try await Matcher.claude(lines: ls, slides: sl) }
-                    catch { note = "Claude couldn't do the matching (\(error.localizedDescription.prefix(120))), so Pare Slides matched by itself. Check the change points." }
-                } else {
-                    note = "Matched without Claude. For better matching, click Connect Claude."
-                }
-                if result.isEmpty {
-                    result = await Task.detached { Matcher.local(lines: ls, slides: sl, duration: dur) }.value
-                }
-                cues = Matcher.tidy(result, slideCount: sl.count, duration: dur)
-            } catch {
-                problem = error.localizedDescription
+            }
+            if !anyDone, let f = jobs.first(where: { if case .failed = $0.state { return true }; return false }),
+               case .failed(let why) = f.state {
+                problem = why
             }
         }
     }
 
+    /// Match one recording again (keeps the transcript).
+    func rematch(_ id: UUID) {
+        guard !busy, let i = jobs.firstIndex(where: { $0.id == id }) else { return }
+        jobs[i].cues = []
+        jobs[i].state = .waiting
+        busy = true
+        Task {
+            await run(id)
+            busy = false
+        }
+    }
+
+    private func update(_ id: UUID, _ change: (inout Job) -> Void) {
+        if let i = jobs.firstIndex(where: { $0.id == id }) { change(&jobs[i]) }
+    }
+
+    private func run(_ id: UUID) async {
+        guard let job = jobs.first(where: { $0.id == id }) else { return }
+        let work = self.work
+        do {
+            // 1. Sound
+            var wav = job.wav
+            if wav == nil {
+                update(id) { $0.state = .working("Taking the sound out…") }
+                wav = try await Audio.extract(job.recording, work: work)
+                update(id) { $0.wav = wav }
+            }
+            guard let wav else { return }
+            if job.duration <= 0, let f = try? AVAudioFile(forReading: wav) {
+                let d = Double(f.length) / f.processingFormat.sampleRate
+                update(id) { $0.duration = d }
+            }
+            // 2. Words, with times
+            var lines = job.lines
+            if lines.isEmpty {
+                update(id) { $0.state = .working("Listening (on this Mac)… long recordings take a while.") }
+                lines = try await Transcriber.transcribe(wav)
+                guard !lines.isEmpty else { throw PGError("No speech was found in this recording.") }
+                update(id) { $0.lines = lines }
+            }
+            // 3. Match, against the whole deck or the chosen range.
+            let lo = (job.from ?? 1) - 1, hi = (job.to ?? slides.count) - 1
+            let subset = Array(slides[max(0, lo)...min(slides.count - 1, max(lo, hi))])
+            let useClaude = ClaudeCLI.find() != nil
+            update(id) { $0.state = .working(useClaude ? "Claude is matching the slides…" : "Matching the slides…") }
+            let dur = jobs.first(where: { $0.id == id })?.duration ?? 0
+            var result: [Cue] = []
+            var jobNote: String?
+            if useClaude {
+                do { result = try await Matcher.claude(lines: lines, slides: subset) }
+                catch { jobNote = "Claude couldn't do the matching (\(error.localizedDescription.prefix(120))), so Pare Slides matched by itself. Check the change points." }
+            } else {
+                jobNote = "Matched without Claude. For better matching, click Connect Claude."
+            }
+            if result.isEmpty {
+                result = await Task.detached { Matcher.local(lines: lines, slides: subset, duration: dur) }.value
+            }
+            let cues = Matcher.tidy(result, slideCount: slides.count, duration: dur)
+            update(id) { $0.cues = cues; $0.note = jobNote; $0.state = .done }
+        } catch {
+            update(id) { $0.state = .failed(error.localizedDescription) }
+        }
+    }
+
+    // MARK: Editing the selected recording
+
     /// The slide on screen at a given time.
     func cueIndex(at t: Double) -> Int? {
-        cues.lastIndex { $0.start <= t + 0.001 } ?? (cues.isEmpty ? nil : 0)
+        let c = cues
+        return c.lastIndex { $0.start <= t + 0.001 } ?? (c.isEmpty ? nil : 0)
     }
 
     func end(of i: Int) -> Double { i + 1 < cues.count ? cues[i + 1].start : duration }
 
     func setStart(_ id: UUID, _ t: Double) {
-        guard let i = cues.firstIndex(where: { $0.id == id }) else { return }
-        cues[i].start = min(max(0, t), max(0, duration - 0.1))
-        cues.sort { $0.start < $1.start }
+        var c = cues
+        guard let i = c.firstIndex(where: { $0.id == id }) else { return }
+        c[i].start = min(max(0, t), max(0, duration - 0.1))
+        c.sort { $0.start < $1.start }
+        cues = c
     }
 
     func insert(slide: Int, at t: Double) {
-        cues.append(Cue(slide: slide, start: min(max(0, t), duration)))
-        cues.sort { $0.start < $1.start }
+        var c = cues
+        c.append(Cue(slide: slide, start: min(max(0, t), duration)))
+        c.sort { $0.start < $1.start }
+        cues = c
     }
 
     func remove(_ id: UUID) { cues.removeAll { $0.id == id } }
+
+    /// Slide indexes for this recording's Media Bin: its range (or the whole deck) plus any slide it uses.
+    func binSlides(for job: Job) -> Set<Int> {
+        let lo = (job.from ?? 1) - 1, hi = (job.to ?? slides.count) - 1
+        var s = Set(max(0, lo)...min(max(0, slides.count - 1), max(lo, hi)))
+        for c in job.cues { s.insert(c.slide) }
+        return s
+    }
+
+    func plan(for job: Job, includeRecording: Bool) -> Export.Plan? {
+        guard let wav = job.wav, job.isDone else { return nil }
+        return Export.Plan(slides: slides, cues: job.cues, duration: job.duration, wav: wav, recording: job.recording,
+                           includeRecording: includeRecording, title: job.name, binOnly: binSlides(for: job))
+    }
 }
 
 // MARK: - Slides from a zip, folder, PDF or images
@@ -417,8 +532,11 @@ enum Matcher {
         transcript lines with their start times in seconds, and the text on each slide.
         Decide when each slide should appear on screen.
         Rules:
-        - Slides almost always go in order. A slide the presenter never talks about may be skipped.
-        - The first slide shown starts at 0.
+        - The recording may cover only PART of the deck. It can start at any slide and end at any slide. \
+        Include only the slides this recording actually talks about.
+        - Slides usually go forward in order. A slide the presenter doesn't talk about is skipped. \
+        Going back to an earlier slide is rare but allowed when the talk clearly returns to it.
+        - The first slide shown starts at 0 (use whichever slide the recording opens on).
         - Put each change at the start time of the transcript line where the presenter starts talking about \
         that slide's content (or says things like "next", "moving on", "let's look at").
         - A slide with no text (a picture) usually sits between the slides around it; include it if the talk moves through it.
@@ -440,7 +558,7 @@ enum Matcher {
         var cues: [Cue] = []
         for item in arr {
             guard let n = (item["slide"] as? NSNumber)?.intValue,
-                  let t = (item["start"] as? NSNumber)?.doubleValue, n >= 1, n <= slides.count else { continue }
+                  let t = (item["start"] as? NSNumber)?.doubleValue, slides.contains(where: { $0.number == n }) else { continue }
             cues.append(Cue(slide: n - 1, start: t))
         }
         guard !cues.isEmpty else { throw PGError("Claude didn't place any slides.") }
@@ -449,7 +567,7 @@ enum Matcher {
 
     /// Without Claude: match words in each line to words on the slides, keeping the slides in order.
     static func local(lines: [Line], slides: [Slide], duration: Double) -> [Cue] {
-        guard !lines.isEmpty, !slides.isEmpty else { return [Cue(slide: 0, start: 0)] }
+        guard !lines.isEmpty, !slides.isEmpty else { return [Cue(slide: max(0, (slides.first?.number ?? 1) - 1), start: 0)] }
         let stop: Set<String> = Set("""
         the a an and or of to in on for with is are be that this it i you your we our my me so as at by from have has was were \
         will can not but do just there what how they their them about also very really lots some here then than when which who
@@ -470,18 +588,19 @@ enum Matcher {
                 ws.filter { sw.contains($0) }.reduce(0) { $0 + idf($1) } / sqrt(Double(1 + ws.count))
             }
         }
-        // Best path that only moves forward through the slides, with a small cost for each change
-        // and for each slide skipped.
-        let change = 0.8, skip = 0.5
+        // Best path through the slides: it can start on any slide, moves forward with a small cost per
+        // change and per slide skipped, and can go back to an earlier slide at a higher cost.
+        let change = 0.8, skip = 0.2, goBack = 2.5
         let L = lines.count, K = slides.count
         var best = Array(repeating: Array(repeating: -Double.infinity, count: K), count: L)
         var back = Array(repeating: Array(repeating: 0, count: K), count: L)
-        for k in 0..<K { best[0][k] = S[0][k] - Double(k) * skip }
+        for k in 0..<K { best[0][k] = S[0][k] }
         for i in 1..<L {
             for k in 0..<K {
                 var bestPrev = best[i - 1][k], arg = k
-                for j in 0..<k {
-                    let v = best[i - 1][j] - change - Double(k - j - 1) * skip
+                for j in 0..<K where j != k {
+                    let cost = j < k ? change + Double(k - j - 1) * skip : goBack
+                    let v = best[i - 1][j] - cost
                     if v > bestPrev { bestPrev = v; arg = j }
                 }
                 best[i][k] = bestPrev + S[i][k]
@@ -495,8 +614,8 @@ enum Matcher {
             if i > 0 { k = back[i][k] }
         }
         var cues: [Cue] = []
-        for (i, k) in path.enumerated() where cues.last?.slide != k {
-            cues.append(Cue(slide: k, start: i == 0 ? 0 : lines[i].start))
+        for (i, k) in path.enumerated() where cues.last?.slide != slides[k].number - 1 {
+            cues.append(Cue(slide: slides[k].number - 1, start: i == 0 ? 0 : lines[i].start))
         }
         return cues
     }
